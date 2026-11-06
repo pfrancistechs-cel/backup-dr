@@ -1,0 +1,95 @@
+name: backupdr
+
+x-python: &python
+  build:
+    context: ./demo
+    args:
+      PYTHON_IMAGE: ${PYTHON_IMAGE:-python:3.12-slim}
+  image: backupdr-demo:local
+  restart: unless-stopped
+
+volumes:
+  pgdata: {}
+  archive: {}
+  pgdata_restore: {}
+
+services:
+  # one-shot: makes the archive volume writable for the postgres user
+  archive-init:
+    image: ${POSTGRES_IMAGE:-postgres:16}
+    container_name: bdr-archive-init
+    user: root
+    restart: "no"
+    command: ["sh", "-c", "mkdir -p /archive/wal /archive/base && chown -R postgres:postgres /archive && chmod 750 /archive"]
+    volumes:
+      - archive:/archive
+
+  # the production database: every finished WAL segment is copied (compressed) to the archive,
+  # and a segment is closed at least every 10 seconds (archive_timeout) even when it is not full
+  db:
+    image: ${POSTGRES_IMAGE:-postgres:16}
+    container_name: bdr-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-demo-password}
+      POSTGRES_INITDB_ARGS: "--wal-segsize=1"
+    command:
+      - postgres
+      - -c
+      - wal_level=replica
+      - -c
+      - archive_mode=on
+      - -c
+      - archive_timeout=10
+      - -c
+      - 'archive_command=test ! -f /archive/wal/%f.gz && gzip -c %p > /archive/wal/%f.gz.tmp && mv /archive/wal/%f.gz.tmp /archive/wal/%f.gz'
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - archive:/archive
+    ports: ["127.0.0.1:5432:5432"]
+    depends_on:
+      archive-init:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 2s
+      timeout: 3s
+      retries: 40
+
+  writer:
+    <<: *python
+    container_name: bdr-writer
+    command: ["python", "/app/writer.py"]
+    environment:
+      DB_HOST: db
+      DB_PASSWORD: ${DB_PASSWORD:-demo-password}
+    ports: ["127.0.0.1:9100:9100"]
+    depends_on:
+      db:
+        condition: service_healthy
+
+  console:
+    <<: *python
+    container_name: bdr-console
+    command: ["python", "/app/console.py"]
+    environment:
+      DB_HOST: db
+      DB_PASSWORD: ${DB_PASSWORD:-demo-password}
+      WRITER_URL: http://writer:9100
+    volumes:
+      - ./results:/results:ro
+    ports: ["8081:8081"]
+    depends_on:
+      db:
+        condition: service_healthy
+
+  # the restore drill: a second, throw-away database rebuilt from the archive. Only started by the scripts.
+  db-restore:
+    image: ${POSTGRES_IMAGE:-postgres:16}
+    container_name: bdr-restore
+    profiles: ["restore"]
+    command: ["postgres", "-c", "archive_mode=off"]
+    volumes:
+      - pgdata_restore:/var/lib/postgresql/data
+      - archive:/archive:ro
+    ports: ["127.0.0.1:5433:5432"]
